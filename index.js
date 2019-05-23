@@ -13,9 +13,6 @@ var logglyConfiguration = {
   tags: 'CloudwatchMetrics'
 };
 
-var encryptedLogglyToken = "your KMS encrypted key";
-var encryptedLogglyTokenBuffer = Buffer.from(encryptedLogglyToken, "base64");
-
 var kms = new AWS.KMS({
   apiVersion: '2014-11-01'
 });
@@ -42,21 +39,27 @@ exports.handler = function (event, context) {
   decryptLogglyToken().then(function () {
     getMetricsListFromAWSCloudwatch().then(function () {
       sendRemainingStatistics().then(function () {
-        context.done('all statistics are sent to Loggly');
+        context.done();
       }, function () {
         context.done();
       });
     }, function () {
         context.done();
     });
-  }, function () {
-    context.done();
+  }, function (reason) {
+    context.done(reason);
   });
   
   //decrypts your Loggly Token from your KMS key
   function decryptLogglyToken() {
 
     return Q.Promise(function (resolve, reject) {
+      if (!process.env.kmsEncryptedCustomerToken) {
+        reject("Environment variable 'kmsEncryptedCustomerToken' is not defined. Define 'kmsEncryptedCustomerToken' " 
+          + "environment variable and set it to KMS encrypted customer token for Loggly.");
+      }
+
+      var encryptedLogglyTokenBuffer = Buffer.from(process.env.kmsEncryptedCustomerToken, "base64");
       var params = {
         CiphertextBlob: encryptedLogglyTokenBuffer
       };
