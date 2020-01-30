@@ -3,15 +3,15 @@ var AWS = require('aws-sdk')
   , Q = require('q')
   , request = require('request');
 
+var counter = 0;
+var metricDataQueriesDict = {};
+
 //loggly url, token and tag configuration
 //user need to edit while uploading code via blueprint
 var logglyConfiguration = {
   url: 'http://logs-01.loggly.com/bulk',
   tags: 'CloudwatchMetrics'
 };
-
-var encryptedLogglyToken = "your KMS encypted key";
-var encryptedLogglyTokenBuffer = new Buffer(encryptedLogglyToken, "base64");
 
 var kms = new AWS.KMS({
   apiVersion: '2014-11-01'
@@ -23,42 +23,47 @@ var cloudwatch = new AWS.CloudWatch({
 
 //entry point
 exports.handler = function (event, context) {
-  var finalData = [];
-  var parsedStatics = [];
+  var parsedStatistics = [];
 
   var nowDate = new Date();
   var date = nowDate.getTime();
 
-  //time upto which we want to fetch Metrics Statics
+  //time up to which we want to fetch Metrics Statistics
   //we keep it one hour
   var logEndTime = nowDate.toISOString();
 
-  //time from which we want to fetch Metrics Statics
+  //time from which we want to fetch Metrics Statistics
   var logStartTime = new Date(date - (05 * 60 * 1000)).toISOString();
 
   //initiate the script here
   decryptLogglyToken().then(function () {
     getMetricsListFromAWSCloudwatch().then(function () {
-      sendRemainingStatics().then(function () {
-        context.done('all statics are sent to Loggly');
+      sendRemainingStatistics().then(function () {
+        context.done();
       }, function () {
         context.done();
       });
     }, function () {
         context.done();
     });
-  }, function () {
-    context.done();
+  }, function (reason) {
+    context.done(reason);
   });
   
   //decrypts your Loggly Token from your KMS key
   function decryptLogglyToken() {
 
     return Q.Promise(function (resolve, reject) {
+      if (!process.env.kmsEncryptedCustomerToken) {
+        reject("Environment variable 'kmsEncryptedCustomerToken' is not defined. Define 'kmsEncryptedCustomerToken' " 
+          + "environment variable and set it to KMS encrypted customer token for Loggly.");
+      }
+
+      var encryptedLogglyTokenBuffer = Buffer.from(process.env.kmsEncryptedCustomerToken, "base64");
       var params = {
         CiphertextBlob: encryptedLogglyTokenBuffer
       };
-
+     
       kms.decrypt(params, function (err, data) {
         if (err) {
           console.log(err, err.stack); // an error occurred
@@ -113,19 +118,33 @@ exports.handler = function (event, context) {
           else {
             var pMetricName, pNamespace, pName, pValue;
 
+            var queries = [];
             for (var i = 0; i < result.Metrics.length; i++) {
               pNamespace = result.Metrics[i].Namespace;
               pMetricName = result.Metrics[i].MetricName;
               for (var j = 0; j < result.Metrics[i].Dimensions.length; j++) {
                 pName = result.Metrics[i].Dimensions[j].Name
                 pValue = result.Metrics[i].Dimensions[j].Value
+
+                if (!pName || !pValue) continue;
+
+                queries.push({metricName: pMetricName, namespace: pNamespace, name: pName, value: pValue});
+                if (queries.length == 20) {
+                  var promise = fetchMetricDataFromMetrics(queries);
+                  promisesResult.push(promise);
+                  queries = [];
+                }
               }
-              var promise = fetchMetricStatisticsFromMetrics(pNamespace, pMetricName, pName, pValue);
-              promisesResult.push(promise)
+            }
+
+            if (queries.length > 0) {
+              var promise = fetchMetricDataFromMetrics(queries);
+              promisesResult.push(promise);
+              queries = [];
             }
           }
-          if (result.NextToken) {
 
+          if (result.NextToken) {
             getMetricsList(result.NextToken);
           }
           else {
@@ -142,9 +161,25 @@ exports.handler = function (event, context) {
     });
   }
 
-  //Gets statistics for the specified metric.
-  function fetchMetricStatisticsFromMetrics(namespace, metricName, dName, dValue) {
-    var MetricStatisticsPromises = [];
+  function getMetricDataQuery(query, stat, id) {
+    return {
+      Id: id,
+      MetricStat: {
+        Metric: {
+          Namespace: query.namespace,
+          MetricName: query.metricName,
+          Dimensions: [{
+            Name: query.name,
+            Value: query.value
+          }]
+        },
+        Period: 60,
+        Stat: stat
+      }
+    };
+  }
+
+  function fetchMetricDataFromMetrics(queries) {
     return Q.Promise(function (resolve, reject) {
 
       /*The maximum number of data points returned from a single GetMetricStatistics request is 1,440, 
@@ -153,65 +188,101 @@ exports.handler = function (event, context) {
       you can alter the request by narrowing the specified time range or increasing the specified period. 
       Alternatively, you can make multiple requests across adjacent time ranges.*/
 
+      var metricDataQueries = [];
+      for (var q in queries) {
+        var id = 'm' + counter;
+        metricDataQueriesDict[id] = queries[q];
+
+        metricDataQueries.push(getMetricDataQuery(queries[q], 'Average', id + '_average'));
+        metricDataQueries.push(getMetricDataQuery(queries[q], 'Minimum', id + '_minimum'));
+        metricDataQueries.push(getMetricDataQuery(queries[q], 'Maximum', id + '_maximum'));
+        metricDataQueries.push(getMetricDataQuery(queries[q], 'SampleCount', id + '_samplecount'));
+        metricDataQueries.push(getMetricDataQuery(queries[q], 'Sum', id + '_sum'));
+        counter++;
+      }
+
       var params = {
         EndTime: logEndTime, //required
-        MetricName: metricName, //required
-        Namespace: namespace, //required
-        Period: 60, //required
         StartTime: logStartTime, //required
-        Statistics: [ //required
-             'Average', 'Minimum', 'Maximum', 'SampleCount', 'Sum'
-        ],
-        Dimensions: [{
-          Name: dName,  // required
-          Value: dValue //required
-        },
-            /* more items */
-        ],
-
+        MetricDataQueries: metricDataQueries
       };
-      var Promises = [];
-      try {
-        cloudwatch.getMetricStatistics(params, function (err, data) {
-          if (err) console.log(err, err.stack); // an error occurred
-          else {
-            for (var a in data.Datapoints) {
-              var promise = parseStatics(data.Datapoints[a], data.ResponseMetadata, data.Label, dName, dValue, namespace)
-              Promises.push(promise);
+
+      function fetch(params, nextToken) {
+        if (nextToken != null) {
+          params.NextToken = nextToken;
+        }
+
+        var promises = [];
+        try {
+          cloudwatch.getMetricData(params, function (err, data) {
+            if (err) {
+              console.log(err, err.stack); // an error occurred
             }
-            Q.allSettled(Promises).then(function () {
-              resolve();
-            }, function () {
-              reject();
-            });
-          }
-        });
+            else {
+              var resultsByStat = {}
+              for (var a in data.MetricDataResults) {
+                var metricId = data.MetricDataResults[a].Id;
+                var parts = metricId.split('_');
+                resultsByStat[parts[0]] = resultsByStat[parts[0]] || {};
+                resultsByStat[parts[0]][parts[1]] = data.MetricDataResults[a];
+              }
+
+              for (var id in resultsByStat) {
+                for (var i in resultsByStat[id]['average'].Timestamps) {
+                  var timestamp = resultsByStat[id]['average'].Timestamps[i];
+                  var average = resultsByStat[id]['average'].Values[i];
+                  var minimum = resultsByStat[id]['minimum'].Values[i];
+                  var maximum = resultsByStat[id]['maximum'].Values[i];
+                  var samplecount = resultsByStat[id]['samplecount'].Values[i];
+                  var sum = resultsByStat[id]['sum'].Values[i];
+
+                  var promise = parseStatistics(timestamp, average, minimum, maximum, samplecount, sum, 
+                    metricDataQueriesDict[id].metricName,
+                    metricDataQueriesDict[id].name,
+                    metricDataQueriesDict[id].value,
+                    metricDataQueriesDict[id].namespace)
+                  promises.push(promise);
+                }
+              }
+              Q.allSettled(promises).then(function () {
+                resolve();
+              }, function () {
+                reject();
+              });
+            }
+
+            if (data.NextToken) {
+              fetch(params, data.NextToken);
+            }
+          });
+        }
+        catch (e) {
+          console.log(e);
+        }
       }
-      catch (e) {
-        console.log(e);
-      }
+      fetch(params);
     });
   }
 
-  //converts the Statics to a valid JSON object with the sufficient infomation required
+  //converts the Statistics to a valid JSON object with the sufficient infomation required
 
-  function parseStatics(metricsStatics, responseMetadata, metricName, dimensionName, dimensionValue, namespace) {
+  function parseStatistics(timestamp, average, minimum, maximum, samplecount, sum, metricName, dimensionName, 
+    dimensionValue, namespace) {
     return Q.promise(function (resolve, reject) {
 
       var staticdata = {
-        "timestamp": metricsStatics.Timestamp.toISOString(),
-        "sampleCount": metricsStatics.SampleCount,
-        "average": metricsStatics.Average,
-        "sum": metricsStatics.Sum,
-        "minimum": metricsStatics.Minimum,
-        "maximum": metricsStatics.Maximum,
-        "unit": metricsStatics.Unit,
+        "timestamp": timestamp.toISOString(),
+        "sampleCount": samplecount,
+        "average": average,
+        "sum": sum,
+        "minimum": minimum,
+        "maximum": maximum,
         "metricName": metricName,
         "namespace": namespace
       };
       staticdata[firstToLowerCase(dimensionName)] = dimensionValue;
 
-      postStaticsToLoggly(staticdata).then(function () {
+      postStatisticsToLoggly(staticdata).then(function () {
         resolve();
       }, function () {
         reject();
@@ -220,30 +291,30 @@ exports.handler = function (event, context) {
     });
   }
 
-  //uploads the statics to Loggly
-  //we will hold the statics in an array until they reaches to 200
+  //uploads the statistics to Loggly
+  //we will hold the statistics in an array until they reaches to 200
   //then set the count of zero.
-  function postStaticsToLoggly(event) {
+  function postStatisticsToLoggly(event) {
 
     return Q.promise(function (resolve, reject) {
-      if (parsedStatics.length == 200) {
+      if (parsedStatistics.length == 200) {
         upload().then(function () {
           resolve();
         }, function () {
           reject();
         });
       } else {
-        parsedStatics.push(event);
+        parsedStatistics.push(event);
         resolve();
       }
     });
   }
 
-  //checks if any more statics are left
-  //after sending Statics in multiples of 100
-  function sendRemainingStatics() {
+  //checks if any more statistics are left
+  //after sending Statistics in multiples of 100
+  function sendRemainingStatistics() {
     return Q.promise(function (resolve, reject) {
-      if (parsedStatics.length > 0) {
+      if (parsedStatistics.length > 0) {
         upload().then(function () {
           resolve();
         }, function () {
@@ -258,19 +329,19 @@ exports.handler = function (event, context) {
   function upload() {
     return Q.promise(function (resolve, reject) {
 
-      //get all the Statics, stringify them and join them
+      //get all the Statistics, stringify them and join them
       //with the new line character which can be sent to Loggly
       //via bulk endpoint
-      var finalResult = parsedStatics.map(JSON.stringify).join('\n');
+      var finalResult = parsedStatistics.map(JSON.stringify).join('\n');
 
-      //empty the main statics array immediately to hold new statics
-      parsedStatics.length = 0;
+      //empty the main statistics array immediately to hold new statistics
+      parsedStatistics.length = 0;
 
       //creating logglyURL at runtime, so that user can change the tag or customer token in the go
       //by modifying the current script
       var logglyURL = logglyConfiguration.url + '/' + logglyConfiguration.customerToken + '/tag/' + logglyConfiguration.tags;
 
-      //create request options to send Statics
+      //create request options to send Statistics
       try {
         var requestOptions = {
           uri: logglyURL,
@@ -280,10 +351,10 @@ exports.handler = function (event, context) {
 
         requestOptions.body = finalResult;
 
-        //now send the Statics to Loggly
+        //now send the Statistics to Loggly
         request(requestOptions, function (err, response, body) {
           if (err) {
-            console.log('Error while uploading Statics to Loggly');
+            console.log('Error while uploading Statistics to Loggly');
             reject();
           } else {
             resolve();
